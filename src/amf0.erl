@@ -15,7 +15,7 @@
 
 -module(amf0).
 -export([decode/1, encode/1]).
-
+-define(D(X), io:format("~p~n", [X])).
 
 %%---------------------------------------
 %% @doc Decode AMF 0 encoded binary data
@@ -88,7 +88,62 @@ read(<<?XML_DOCUMENT, Length:32, String:Length/binary, Remaining/binary>>, Objec
 
 read(<<?AVMPLUS_OBJECT, AMF3/binary>>, Objects) ->
     {Object, Remaining} = amf3:decode(AMF3),
-    {{avmplus, Object}, Remaining, Objects}.
+    {{avmplus, Object}, Remaining, Objects};
+    
+read(<<?STRICT_ARRAY, Size:32, Remaining/binary>>, Objects) ->
+    store_in_refs(fun(Objects1) ->
+      read_array(Remaining, Size, [], Objects1)
+    end, Objects);
+
+read(<<?ECMA_ARRAY, _Size:32, Remaining/binary>>, Objects) ->
+    {{object,Val}, Rest, Objects2} = store_in_refs(fun(Objects1) ->
+      read_object(Remaining, [], Objects1, ecma_array)
+    end, Objects),
+    {Val, Rest, Objects2};
+
+read(<<?OBJECT, Remaining/binary>>, Objects) ->
+    store_in_refs(fun(Objects1) ->
+      read_object(Remaining, [], Objects1, undefined)
+    end, Objects);
+
+read(<<?TYPED_OBJECT, Len:16, Class:Len/binary, Remaining/binary>>, Objects) ->
+    store_in_refs(fun(Objects1) ->
+      read_object(Remaining, [], Objects1, binary_to_atom(Class, utf8))
+    end, Objects);
+
+read(<<?REFERENCE, Index:16, Remaining/binary>>, Objects) ->
+    ?D({"Read",Index}),
+    {dict:fetch(Index, Objects), Remaining, Objects}.
+
+read_array(Remaining, Size, Array, Objects) when length(Array) == Size ->
+    {lists:reverse(Array), Remaining, Objects};
+  
+read_array(Bin, Size, Array, Objects) ->
+    {Val, Remaining, Objects1} = read(Bin, Objects),
+    read_array(Remaining, Size, [Val|Array], Objects1).
+
+
+read_object(<<0:16, ?OBJECT_END, Remaining/binary>>, Object, Objects, Class) ->
+    Val = case Class of
+      undefined -> {object, lists:reverse(Object)};
+      ecma_array -> {object, lists:reverse(Object)};
+      _ -> {object, Class, lists:reverse(Object)}
+    end,
+    {Val, Remaining, Objects};
+
+read_object(<<Len:16, Key:Len/binary, Bin/binary>>, Object, Objects, Class) ->
+    {Val, Remaining, Objects1} = read(Bin, Objects),
+    K = case Class of
+      ecma_array -> Key;
+      _ -> binary_to_atom(Key, utf8)
+    end,
+    read_object(Remaining, [{K, Val}|Object], Objects1, Class).
+
+store_in_refs(Fun, Objects) ->
+  Index = dict:size(Objects),
+  Objects1 = dict:store(Index, place_holder, Objects),
+  {Val, Remaining, Objects2} = Fun(Objects1),
+  {Val, Remaining, dict:store(Index, Val, Objects2)}.
 
 
 %%---------------------------------------
@@ -120,5 +175,50 @@ write({xmldoc, XML}, Objects) ->
 
 write({avmplus, Object}, Objects) ->
     Binary = amf3:encode(Object),
-    {<<?AVMPLUS_OBJECT, Binary/binary>>, Objects}.
+    {<<?AVMPLUS_OBJECT, Binary/binary>>, Objects};
+
+write({object, Object}, Objects) ->
+    write_object(Object, <<?OBJECT>>, Objects);
+
+write({object, Name, Object}, Objects) ->
+    NameS = binarize(Name),
+    write_object(Object, <<?TYPED_OBJECT, (size(NameS)):16, NameS/binary>>, Objects);
+
+write([{Key,_Value}|_] = Object, Objects) when is_binary(Key) ->
+    write_object(Object, <<?ECMA_ARRAY, (length(Object)):32>>, Objects);
+
+
+write([{_Key,_Value}|_] = Object, Objects) ->
+    write({object, Object}, Objects);
+
+write(Array, Objects) when is_list(Array) ->
+    write_array(Array, <<?STRICT_ARRAY, (length(Array)):32>>, Objects).
+
+
+write_array([], Acc, Objects) ->
+    {Acc, Objects};
+
+write_array([Value|Array], Acc, Objects) ->
+    {Bin, Objects1} = write(Value, Objects),
+    write_array(Array, <<Acc/binary, Bin/binary>>, Objects1).
+
+
+write_object([], Acc, Objects) ->
+    {<<Acc/binary, 0:16, ?OBJECT_END>>, Objects};
+
+write_object([{Key,Value}|Array], Acc, Objects) ->
+    {Bin, Objects1} = write(Value, Objects),
+    KeyS = binarize(Key),
+    write_object(Array, <<Acc/binary, (size(KeyS)):16, KeyS/binary, Bin/binary>>, Objects1).
+
+
+binarize(S) when is_atom(S) -> atom_to_binary(S, latin1);
+binarize(S) when is_list(S) -> list_to_binary(S);
+binarize(S) when is_binary(S) -> S;
+binarize(S) when is_integer(S) -> binarize(integer_to_list(S)).
+
+
+
+
+
     
